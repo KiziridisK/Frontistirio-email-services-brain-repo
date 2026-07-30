@@ -19,6 +19,16 @@ Built the whole feature end-to-end on top of the existing (empty) `/emails` UI s
 
 **Still pending — see [TODO](#todo--εκκρεμότητες) at the bottom.** The big ones: SNS webhook not yet wired (so status stops at "sent", never "delivered"); SES still in sandbox; `SES_FROM` is a `@gmail.com` address → lands in spam (must use a verified owned domain + DKIM).
 
+### 2026-07-30 — SES production rollout + Brevo fully removed
+All three "blocking real-world use" items are done, and email now sends for real (out of sandbox, deliverable, tracked). **All SES config is in region `eu-central-1`** (sandbox/prod + domain verification are per-region — NOT the us-east-1 of the CloudFront cert).
+
+- **Verified sending domain `eduflow.gr`** with **Easy DKIM** (RSA-2048, `Verified:SUCCESS`) + custom **MAIL FROM** `mail.eduflow.gr` (SPF alignment) + **DMARC** `_dmarc.eduflow.gr` (now `p=quarantine`). DNS records live in the eduflow.gr Route 53 zone (3 DKIM CNAMEs, MAIL FROM MX+SPF-TXT, DMARC TXT — **zone id + exact records in the private custom-domain brain**). `SES_FROM` is now `no-reply@eduflow.gr`. **Confirmed:** a live send landed in the Gmail **Inbox** (not spam), fixing BUG-EML-003.
+- **Delivery-tracking pipeline wired**: Configuration Set **`frontistirio-events`** → SNS topic `frontistirio-ses-events` (topic policy grants `ses.amazonaws.com` publish) → HTTPS subscription **CONFIRMED** to `POST /emails/ses-webhook`. The REST API got the `/emails/ses-webhook` resource (auth NONE, HTTP_PROXY→EC2) + Prod deploy — **gateway/resource ids in the private aws-infrastructure brain**. `SES_CONFIGURATION_SET=frontistirio-events`. **SNS signature verification** (`sns-validator`) added to `handleSesWebhook` + AWS-host guard on SubscribeURL (fixes BUG-EML-004). Verified end-to-end: SNS metrics showed `MessagesPublished=2 / NotificationsDelivered=2 / Failed=0`.
+- **Production access GRANTED** (out of sandbox): quota **50,000/day, 14/s**. The `put-account-details` request first showed `ReviewDetails.Status:DENIED` while its support case stayed open; approval flipped `ProductionAccessEnabled:true` ~3 days later via the case reply (a CLI re-submit while the case was open returned `ConflictException` — the DENIED flag was stale, the case was still live). The Support API needs a Business plan, so case replies go through the web console.
+- **Brevo removed entirely**: the **student** and **parent** invites now go through the SES transactional core (`services/inviteMailer.js`), like the teacher invite. `inviteMailer` is now role-agnostic via an **`accountKind`** param ("μαθητή"/"γονέα"/"καθηγητή") + generic "Όνομα χρήστη:" label. Deleted `utils/mailService.js` + `models/mailLog.js`; dropped the dead `SES_FROM || SMTP_FROM` fallbacks; removed `SMTP_*` from the EC2 `.env`. **`nodemailer` stays** (sesMailer's MIME composer for attachments).
+
+**Gotchas:** `aws sesv2 send-email --content file://…` with a Greek UTF-8 body fails "could not be decoded" → set `AWS_CLI_FILE_ENCODING=utf-8`. The EC2 box has no GitHub creds (HTTPS remote, `git pull` fails) so deploys go via a **git bundle over SSH** (`git bundle create … <old>..test` → scp → `git fetch <bundle> test` + `git merge --ff-only`) — see custom-domain brain.
+
 ---
 
 ## Architecture overview
@@ -143,10 +153,11 @@ DELIVERY EVENTS:  SES → Configuration Set → SNS → POST /emails/ses-webhook
 
 ### Env vars (`.env`)
 ```
-SES_FROM=...                 # MUST be a verified SES identity (currently a @gmail.com → spam!)
-SES_FROM_NAME=Frontistirio   # fallback display name
-SES_CONFIGURATION_SET=       # SES config set that publishes events to SNS (EMPTY → no delivery tracking)
+SES_FROM=no-reply@eduflow.gr      # verified domain identity (was @gmail.com → spam; fixed 2026-07-30)
+SES_FROM_NAME=Frontistirio        # fallback display name (store name overrides at send time)
+SES_CONFIGURATION_SET=frontistirio-events   # SES config set → SNS → webhook (delivery tracking)
 # reuses AWS_REGION / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (region eu-central-1)
+# NOTE: SMTP_* (old Brevo) removed 2026-07-30 — everything sends through SES now.
 ```
 
 ### Maintenance scripts
@@ -173,21 +184,23 @@ SES_CONFIGURATION_SET=       # SES config set that publishes events to SNS (EMPT
 
 ---
 
-## AWS setup required (manual, NOT in code)
+## AWS setup (manual, NOT in code) — ✅ DONE 2026-07-30 (region eu-central-1)
 
-1. **Verify a sending identity** in SES (Frankfurt / eu-central-1) → set `SES_FROM`.
-2. **Configuration Set** with an **SNS event destination** → set `SES_CONFIGURATION_SET`. Without it, mail sends but recipients stay on `sent` (never `delivered`).
-3. **Subscribe** the webhook URL (`/emails/ses-webhook`) to the SNS topic. Local dev: SNS can't reach `localhost` → use an **ngrok** tunnel.
-4. **Request production access** (sandbox = verified recipients only).
+1. ✅ **Sending identity**: domain `eduflow.gr` verified + Easy DKIM + MAIL FROM `mail.eduflow.gr`. `SES_FROM=no-reply@eduflow.gr`.
+2. ✅ **Configuration Set** `frontistirio-events` with an SNS event destination (topic `frontistirio-ses-events`). `SES_CONFIGURATION_SET=frontistirio-events`.
+3. ✅ **Subscribed** the webhook (the API Gateway `Prod` URL + `/emails/ses-webhook`) to the SNS topic — auto-confirmed by the handler. (Local dev still needs an ngrok tunnel since SNS can't reach `localhost`.)
+4. ✅ **Production access GRANTED** — out of sandbox, quota 50,000/day, 14/s.
+
+> Redo-from-scratch commands + the API Gateway wiring for the webhook resource are in the change-log entry above and the aws-infrastructure brain.
 
 ---
 
 ## TODO / Εκκρεμότητες
 
-### 🔴 Blocking real-world use
-- [ ] **Verified sending domain + Easy DKIM.** `SES_FROM` is a `@gmail.com` address → fails SPF/DKIM/DMARC alignment for gmail.com → **Gmail spam-folders it**. Verify an OWNED domain, enable Easy DKIM (3 CNAMEs), set `SES_FROM=no-reply@<domain>`. (Code unchanged.)
-- [ ] **SES production access.** Still in sandbox — every recipient must be verified. Request production access in the SES console.
-- [ ] **SNS delivery webhook.** Create the Configuration Set → SNS topic → subscribe `/emails/ses-webhook`; set `SES_CONFIGURATION_SET`. This is what turns recipient pills 🟠→🟢 (`delivered`) / 🔴 (`bounced`). Until then we're "blind" to the real outcome.
+### ✅ Blocking real-world use — ALL DONE 2026-07-30
+- [x] **Verified sending domain + Easy DKIM.** `eduflow.gr` verified + Easy DKIM + MAIL FROM `mail.eduflow.gr` + DMARC `p=quarantine`; `SES_FROM=no-reply@eduflow.gr`. Live send confirmed in Gmail Inbox (not spam).
+- [x] **SES production access.** Granted — out of sandbox, quota 50,000/day, 14/s.
+- [x] **SNS delivery webhook.** Config Set `frontistirio-events` → SNS `frontistirio-ses-events` → subscribed `/emails/ses-webhook` (wired in API Gateway + deployed) with `sns-validator` signature check; `SES_CONFIGURATION_SET` set. Pills now go 🟠→🟢/🔴.
 
 ### 🟠 Robustness / scale
 - [ ] **Move scheduling/sending to a job queue (BullMQ)** for retries/backoff and multi-instance safety. Current `setInterval` worker is in-process only; immediate send loops recipients **synchronously in the request** (fine for school-size lists, not for large blasts).
@@ -197,6 +210,6 @@ SES_CONFIGURATION_SET=       # SES config set that publishes events to SNS (EMPT
 ### 🟢 Enhancements
 - [ ] **Live email preview in compose** (show the branded template before sending).
 - [ ] **Per-store branding** in the template (logo + brand colour from store settings; currently hardcoded `#3b5bdb`).
-- [ ] **Unify the invitation flow** onto this SES core. The old `utils/mailService.js` (Brevo SMTP) + `models/mailLog.js` still send invitations separately — candidate to merge so invitations also get delivery tracking.
+- [x] **Unify the invitation flow** onto this SES core — **DONE 2026-07-30** (Brevo removed). Teacher (2026-07-06), then **student + parent** (2026-07-30) invites all go through `services/inviteMailer.js` → `sesMailer.sendOneEmail` (transactional; temp password never persisted — no Email doc, no MailLog). `sendInviteEmail({to, recipientName, storeName, username, password, loginUrl, accountKind, fromAddress, fromName, configurationSetName})` — `accountKind` ("μαθητή"/"γονέα"/"καθηγητή") makes the copy role-agnostic. Called from `users.createStoreStudentUser` (before-commit, rollback on fail), `createStoreParentUser` (best-effort — parents may be phone-only), `createStoreTeacherUser`/`resendStoreTeacherInvite`. `utils/mailService.js` + `models/mailLog.js` **deleted**; `SMTP_*` env removed. Trade-off: transactional invites get NO per-recipient delivery tracking (fine for a one-off credential email).
 - [ ] **Attachments display: file sizes / download** on the detail page (currently filename + source icon only).
 - [ ] **Search+modal for ad-hoc files** too (if needed) — materials already got this treatment.
