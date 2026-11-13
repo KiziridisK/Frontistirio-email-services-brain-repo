@@ -35,6 +35,27 @@ All three "blocking real-world use" items are done, and email now sends for real
 
 **Gotchas:** `aws sesv2 send-email --content file://…` with a Greek UTF-8 body fails "could not be decoded" → set `AWS_CLI_FILE_ENCODING=utf-8`. The EC2 box has no GitHub creds (HTTPS remote, `git pull` fails) so deploys go via a **git bundle over SSH** (`git bundle create … <old>..test` → scp → `git fetch <bundle> test` + `git merge --ff-only`) — see custom-domain brain.
 
+### 2026-11-13 — `nodemailer` 10, a test for the attachment path, store-scoped read / cancel
+Verified against code @ API `1b4e51c`. Only what is listed here was re-read; the rest of this document is still
+the 2026-07-30 text.
+
+- **`nodemailer` 7 → 10.** The only thing this codebase uses it for is `nodemailer/lib/mail-composer`, which builds
+  the **raw MIME** message SES needs when an email carries a file. The deep import still resolves (v10 maps
+  `./lib/*` in its `exports`). Nothing else in `services/sesMailer.js` changed.
+- **New `services/__tests__/sesMailer.test.js`** — the first test that looks at those bytes. It asserts what a mail
+  client will make of the message, not the exact bytes (boundaries, folding and the choice of transfer encoding are
+  the library's business): Greek survives in the subject, the sender name, both bodies and the **file names**
+  (including one too long for a single header line), every attachment comes out byte for byte with its content
+  type, and a message over the 10 MB SES limit is refused before anything is sent. It carries its own small MIME
+  parser, so it does not depend on a second mail library agreeing with the first. Written and passed on
+  `nodemailer` 7 first, then on 10. `sesClient` is stubbed — nothing is sent.
+- **`GET /emails/get-email/:emailId` and `POST /emails/cancel` are store-scoped.** `getEmail(id, { storeId })` and
+  `cancelScheduledEmail(id, storeId, userId)` put the caller's store in the filter; another store's id reads as
+  not found (422 `email_not_found`) or as not cancelable (409). Covered by
+  `test/integration/foreign-ids.int.test.js`.
+- **Not re-verified here:** a real send through SES with an attachment. The test covers the message that is built,
+  not its delivery.
+
 ---
 
 ## Architecture overview
